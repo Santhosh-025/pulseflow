@@ -46,7 +46,6 @@ Idempotent Business Processing
        |
        v
 PostgreSQL
-```
 
 Redis will be introduced where useful for temporary coordination and other fast operations.
 
