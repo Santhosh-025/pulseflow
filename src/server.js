@@ -4,6 +4,7 @@ const pool = require("./db");
 
 const app = express();
 const PORT = 3000;
+const MAX_RETRIES = 3;
 
 app.use(express.json());
 
@@ -11,6 +12,7 @@ app.get("/health", (req, res) => {
     res.json({ status: "ok" });
 });
 
+// Shared processing logic
 async function processEvent(client, eventId, simulateFailure = false) {
     if (simulateFailure) {
         throw new Error("Simulated processing failure");
@@ -19,14 +21,13 @@ async function processEvent(client, eventId, simulateFailure = false) {
     await client.query(
         `UPDATE processed_events
          SET status = 'processed',
-             error_message = NULL,
-             retry_count = retry_count + 1
+             error_message = NULL
          WHERE event_id = $1`,
         [eventId]
     );
 }
 
-
+// Receive a new webhook
 app.post("/webhooks/payment", async (req, res) => {
     const { eventId, type, amount } = req.body;
     const simulateFailure = req.body.simulateFailure === true;
@@ -45,13 +46,15 @@ app.post("/webhooks/payment", async (req, res) => {
         });
     }
 
-    const client = await pool.connect();
+    let client;
 
     try {
+        client = await pool.connect();
         await client.query("BEGIN");
 
         const result = await client.query(
-            `INSERT INTO processed_events (event_id, event_type, amount)
+            `INSERT INTO processed_events
+                (event_id, event_type, amount)
              VALUES ($1, $2, $3)
              ON CONFLICT (event_id) DO NOTHING
              RETURNING event_id`,
@@ -67,60 +70,53 @@ app.post("/webhooks/payment", async (req, res) => {
             });
         }
 
-        if (simulateFailure) {
-              throw new Error("Simulated processing failure");
-        }
-
-        await client.query(
-            `UPDATE processed_events
-             SET status = 'processed'
-             WHERE event_id = $1`,
-            [eventId]
-        );
-
+        await processEvent(client, eventId, simulateFailure);
         await client.query("COMMIT");
 
         return res.status(201).json({
             message: "Event processed successfully",
             eventId
         });
+
     } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+        if (client) {
+            await client.query("ROLLBACK").catch(() => {});
+        }
 
-    console.error("Webhook processing failed:", error.message);
+        console.error("Webhook processing failed:", error.message);
 
-    try {
-        await pool.query(
-            `INSERT INTO processed_events
-                (event_id, event_type, amount, status, error_message)
-             VALUES ($1, $2, $3, 'failed', $4)
-              ON CONFLICT (event_id) DO NOTHING`,
-            [eventId, type, amount, error.message]
-        );
-    } catch (dbError) {
-        console.error("Could not save failed event:", dbError.message);
-    }
+        try {
+            await pool.query(
+                `INSERT INTO processed_events
+                    (event_id, event_type, amount, status, error_message)
+                 VALUES ($1, $2, $3, 'failed', $4)
+                 ON CONFLICT (event_id) DO NOTHING`,
+                [eventId, type, amount, error.message]
+            );
+        } catch (dbError) {
+            console.error("Could not save failed event:", dbError.message);
+        }
 
-    return res.status(500).json({
-        error: "Internal server error"
-    });
-}
-    finally {
-        client.release();
+        return res.status(500).json({
+            error: "Internal server error"
+        });
+
+    } finally {
+        if (client) client.release();
     }
 });
 
-
+// Retry an existing failed event
 app.post("/webhooks/retry/:eventId", async (req, res) => {
     const { eventId } = req.params;
-
-    const client = await pool.connect();
+    let client;
 
     try {
+        client = await pool.connect();
         await client.query("BEGIN");
 
         const result = await client.query(
-            `SELECT event_id, event_type, amount, status ,retry_count
+            `SELECT event_id, status, retry_count
              FROM processed_events
              WHERE event_id = $1
              FOR UPDATE`,
@@ -137,17 +133,6 @@ app.post("/webhooks/retry/:eventId", async (req, res) => {
 
         const event = result.rows[0];
 
-        const MAX_RETRIES = 3;
-
-        if (event.retry_count >= MAX_RETRIES) {
-                await client.query("ROLLBACK");
-
-                return res.status(429).json({
-                    error: "Maximum retry attempts reached",
-                    eventId
-                });
-        }
-
         if (event.status !== "failed") {
             await client.query("ROLLBACK");
 
@@ -157,48 +142,79 @@ app.post("/webhooks/retry/:eventId", async (req, res) => {
             });
         }
 
-        // Simulate successful retry for now.
-        await processEvent(
-            client,
-            eventId,
-            req.body.simulateFailure === true
-        );
+        if (event.retry_count >= MAX_RETRIES) {
+            await client.query("ROLLBACK");
 
-        await client.query("COMMIT");
+            return res.status(429).json({
+                error: "Maximum retry attempts reached",
+                eventId
+            });
+        }
 
-        return res.status(200).json({
-            message: "Event retried successfully",
-            eventId,
-            status: "processed"
-        });
+        try {
+            await processEvent(
+                client,
+                eventId,
+                req.body.simulateFailure === true
+            );
+
+            await client.query(
+                `UPDATE processed_events
+                 SET retry_count = retry_count + 1
+                 WHERE event_id = $1`,
+                [eventId]
+            );
+
+            await client.query("COMMIT");
+
+            return res.status(200).json({
+                message: "Event retried successfully",
+                eventId,
+                status: "processed"
+            });
+
+        } catch (processingError) {
+            // Record the failed retry and its count
+            // in the same transaction.
+            await client.query(
+                `UPDATE processed_events
+                 SET status = 'failed',
+                     error_message = $2,
+                     retry_count = retry_count + 1
+                 WHERE event_id = $1`,
+                [eventId, processingError.message]
+            );
+
+            await client.query("COMMIT");
+
+            console.error("Retry failed:", processingError.message);
+
+            return res.status(500).json({
+                error: "Retry processing failed",
+                eventId
+            });
+        }
+
     } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+        if (client) {
+            await client.query("ROLLBACK").catch(() => {});
+        }
 
-    console.error("Retry failed:", error.message);
+        console.error("Retry endpoint failed:", error.message);
 
-    try {
-        await pool.query(
-            `UPDATE processed_events
-             SET status = 'failed',
-                 error_message = $2,
-                 retry_count = retry_count + 1
-             WHERE event_id = $1`,
-            [eventId, error.message]
-        );
-    } catch (dbError) {
-        console.error("Could not record retry failure:", dbError.message);
+        return res.status(500).json({
+            error: "Internal server error"
+        });
+
+    } finally {
+        if (client) client.release();
     }
+});
 
-    return res.status(500).json({
-        error: "Retry processing failed",
-        eventId
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`PulseFlow running on port ${PORT}`);
     });
-} finally {
-        client.release();
-    }
-});
+}
 
-
-app.listen(PORT, () => {
-    console.log(`PulseFlow running on port ${PORT}`);
-});
+module.exports = app;
